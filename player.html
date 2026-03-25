@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>BeStrong YouTube Player</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background-color: #000;
+        overflow: hidden;
+      }
+      #player {
+        width: 100%;
+        height: 100vh;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="player"></div>
+    <script>
+      (function () {
+        'use strict';
+
+        // Message bridge: use ReactNativeWebView if available (direct load),
+        // otherwise postMessage to parent (iframe mode from bestrong-app.com)
+        function sendMessage(data) {
+          var json = typeof data === 'string' ? data : JSON.stringify(data);
+          if (window.ReactNativeWebView) {
+            window.ReactNativeWebView.postMessage(json);
+          } else if (window.parent !== window) {
+            window.parent.postMessage({ source: 'yt-player', payload: json }, '*');
+          }
+          // Browser testing: no-op, player still works visually
+        }
+
+        // Listen for commands relayed from parent (bestrong-app.com)
+        window.addEventListener('message', function (event) {
+          if (event.data && event.data.source === 'yt-relay' && event.data.command) {
+            window.__execCommand(event.data.command);
+          }
+        });
+
+        var params = new URLSearchParams(window.location.search);
+        var videoId = params.get('videoId');
+        var origin = params.get('origin') || window.location.origin;
+        var autoplay = params.get('autoplay') === 'true' ? 1 : 0;
+        var controls = params.get('controls') !== 'false' ? 1 : 0;
+        var loop = params.get('loop') === 'true' ? 1 : 0;
+        var muted = params.get('muted') === 'true' ? 1 : 0;
+        var playsinline = params.get('playsinline') !== 'false' ? 1 : 0;
+        var rel = params.get('rel') !== 'false' ? 1 : 0;
+        var startTime = parseInt(params.get('startTime'), 10) || 0;
+        var endTime = params.get('endTime')
+          ? parseInt(params.get('endTime'), 10)
+          : undefined;
+
+        if (!videoId) {
+          document.body.innerHTML =
+            '<div style="width:100%;height:100vh;display:flex;justify-content:center;align-items:center;color:#fff;">No video ID provided</div>';
+          return;
+        }
+
+        // Build playerVars — YT.Player will create the iframe and inject
+        // its own internal parameters (including ad-serving params)
+        var playerVars = {
+          enablejsapi: 1,
+          origin: origin,
+          autoplay: autoplay,
+          controls: controls,
+          loop: loop,
+          playsinline: playsinline,
+          rel: rel,
+          start: startTime,
+        };
+        // Only add mute if explicitly requested — muted embeds suppress pre-roll ads
+        if (muted) {
+          playerVars.mute = 1;
+        }
+        if (endTime !== undefined) {
+          playerVars.end = endTime;
+        }
+
+        // Load YouTube IFrame API
+        var tag = document.createElement('script');
+        tag.src = 'https://www.youtube.com/iframe_api';
+        tag.onerror = function () {
+          sendMessage({
+            type: 'error',
+            error: { code: -2, message: 'Failed to load YouTube API' },
+          });
+        };
+        document.head.appendChild(tag);
+
+        var player;
+        var progressInterval;
+        var isDestroyed = false;
+
+        function cleanup() {
+          isDestroyed = true;
+          if (progressInterval) {
+            clearInterval(progressInterval);
+            progressInterval = null;
+          }
+        }
+
+        window.addEventListener('beforeunload', cleanup);
+
+        function sendProgress() {
+          if (player && player.getCurrentTime) {
+            try {
+              var currentTime = player.getCurrentTime();
+              var duration = player.getDuration();
+              var percentage =
+                duration > 0 ? (currentTime / duration) * 100 : 0;
+              var loadedFraction = player.getVideoLoadedFraction();
+
+              sendMessage(
+                JSON.stringify({
+                  type: 'progress',
+                  progress: {
+                    currentTime: currentTime,
+                    duration: duration,
+                    percentage: percentage,
+                    loadedFraction: loadedFraction,
+                  },
+                })
+              );
+            } catch (error) {}
+          }
+        }
+
+        function startProgressTracking() {
+          if (
+            isDestroyed ||
+            typeof window.currentInterval !== 'number' ||
+            window.currentInterval <= 0
+          ) {
+            return;
+          }
+
+          if (progressInterval) {
+            clearInterval(progressInterval);
+          }
+
+          progressInterval = setInterval(function () {
+            if (isDestroyed || !player || !player.getCurrentTime) {
+              stopProgressTracking();
+              return;
+            }
+            sendProgress();
+          }, window.currentInterval);
+        }
+
+        function stopProgressTracking() {
+          if (progressInterval) {
+            clearInterval(progressInterval);
+            progressInterval = null;
+          }
+        }
+
+        // Let YT.Player create the iframe from the <div> — this is YouTube's
+        // recommended approach and ensures all internal ad parameters are included
+        window.onYouTubeIframeAPIReady = function () {
+          if (isDestroyed) {
+            return;
+          }
+
+          try {
+            player = new YT.Player('player', {
+              width: '100%',
+              height: '100%',
+              videoId: videoId,
+              playerVars: playerVars,
+              events: {
+                onReady: function (event) {
+                  if (isDestroyed) return;
+
+                  var playerInfo = event.target.playerInfo;
+
+                  try {
+                    sendMessage(
+                      JSON.stringify({
+                        type: 'ready',
+                        playerInfo: {
+                          availablePlaybackRates:
+                            playerInfo.availablePlaybackRates,
+                          availableQualityLevels:
+                            playerInfo.availableQualityLevels,
+                          currentTime: playerInfo.currentTime,
+                          duration: playerInfo.duration,
+                          muted: playerInfo.muted,
+                          playbackQuality: playerInfo.playbackQuality,
+                          playbackRate: playerInfo.playbackRate,
+                          playerState: playerInfo.playerState,
+                          size: playerInfo.size,
+                          volume: playerInfo.volume,
+                        },
+                      })
+                    );
+                    startProgressTracking();
+                  } catch (error) {}
+                },
+                onStateChange: function (event) {
+                  if (isDestroyed) return;
+
+                  try {
+                    sendMessage(
+                      JSON.stringify({
+                        type: 'stateChange',
+                        state: event.data,
+                      })
+                    );
+
+                    if (event.data === YT.PlayerState.ENDED) {
+                      stopProgressTracking();
+                      sendProgress();
+                    } else if (
+                      event.data === YT.PlayerState.PLAYING ||
+                      event.data === YT.PlayerState.BUFFERING
+                    ) {
+                      startProgressTracking();
+                    } else if (
+                      event.data === YT.PlayerState.PAUSED ||
+                      event.data === YT.PlayerState.CUED
+                    ) {
+                      stopProgressTracking();
+                      sendProgress();
+                    } else {
+                      stopProgressTracking();
+                    }
+                  } catch (error) {}
+                },
+                onError: function (event) {
+                  if (isDestroyed) return;
+
+                  var errorMessages = {
+                    2: 'INVALID_PARAMETER_VALUE',
+                    5: 'HTML5_PLAYER_ERROR',
+                    100: 'VIDEO_NOT_FOUND_OR_PRIVATE',
+                    101: 'EMBEDDED_PLAYBACK_NOT_ALLOWED',
+                    150: 'EMBEDDED_PLAYBACK_NOT_ALLOWED_SAME_AS_101',
+                  };
+
+                  try {
+                    sendMessage(
+                      JSON.stringify({
+                        type: 'error',
+                        error: {
+                          code: event.data,
+                          message:
+                            errorMessages[event.data] ||
+                            'Unknown error: ' + event.data,
+                        },
+                      })
+                    );
+                  } catch (error) {}
+                },
+                onPlaybackRateChange: function (event) {
+                  if (isDestroyed) return;
+
+                  try {
+                    sendMessage(
+                      JSON.stringify({
+                        type: 'playbackRateChange',
+                        playbackRate: event.data,
+                      })
+                    );
+                  } catch (error) {}
+                },
+                onPlaybackQualityChange: function (event) {
+                  if (isDestroyed) return;
+
+                  try {
+                    sendMessage(
+                      JSON.stringify({
+                        type: 'playbackQualityChange',
+                        quality: event.data,
+                      })
+                    );
+                  } catch (error) {}
+                },
+                onAutoplayBlocked: function () {
+                  if (isDestroyed) return;
+
+                  try {
+                    sendMessage(
+                      JSON.stringify({ type: 'autoplayBlocked' })
+                    );
+                  } catch (error) {}
+                },
+              },
+            });
+          } catch (error) {
+            sendMessage({
+              type: 'error',
+              error: {
+                code: -3,
+                message: 'Failed to create player: ' + error.message,
+              },
+            });
+          }
+        };
+
+        window.__execCommand = function (commandData) {
+          if (isDestroyed) return;
+
+          try {
+            var command = commandData.command;
+            var args = commandData.args || [];
+            var id = commandData.id;
+
+            if (
+              window.playerCommands &&
+              typeof window.playerCommands[command] === 'function'
+            ) {
+              var result = window.playerCommands[command].apply(null, args);
+
+              if (result instanceof Promise) {
+                return result
+                  .then(function (r) {
+                    if (id) {
+                      sendMessage({ type: 'commandResult', id: id, result: r });
+                    }
+                  })
+                  .catch(function (err) {
+                    if (id) {
+                      sendMessage({ type: 'error', id: id, error: { code: -5, message: err && err.message ? err.message : String(err) } });
+                    }
+                  });
+              }
+
+              if (id) {
+                sendMessage({ type: 'commandResult', id: id, result: result });
+              }
+
+              return result;
+            } else {
+              if (id) {
+                sendMessage({ type: 'error', id: id, error: { code: -4, message: 'Command not found: ' + command } });
+              }
+            }
+          } catch (error) {
+            if (commandData.id) {
+              sendMessage({ type: 'error', id: commandData.id, error: { code: -5, message: 'Execution failed: ' + error.message } });
+            }
+          }
+        };
+
+        window.playerCommands = {
+          play: function () {
+            return player && player.playVideo();
+          },
+          pause: function () {
+            return player && player.pauseVideo();
+          },
+          stop: function () {
+            return player && player.stopVideo();
+          },
+          seekTo: function (seconds, allowSeekAhead) {
+            if (!player) return;
+            player.seekTo(seconds, allowSeekAhead !== false);
+            setTimeout(sendProgress, 200);
+          },
+          setVolume: function (volume) {
+            return player && player.setVolume(volume);
+          },
+          getVolume: function () {
+            return player ? player.getVolume() : 0;
+          },
+          mute: function () {
+            return player && player.mute();
+          },
+          unMute: function () {
+            return player && player.unMute();
+          },
+          isMuted: function () {
+            return player ? player.isMuted() : false;
+          },
+          getCurrentTime: function () {
+            return player ? player.getCurrentTime() : 0;
+          },
+          getDuration: function () {
+            return player ? player.getDuration() : 0;
+          },
+          getVideoUrl: function () {
+            return player ? player.getVideoUrl() : '';
+          },
+          getVideoEmbedCode: function () {
+            return player ? player.getVideoEmbedCode() : '';
+          },
+          getPlaybackRate: function () {
+            return player ? player.getPlaybackRate() : 1;
+          },
+          setPlaybackRate: function (rate) {
+            return player && player.setPlaybackRate(rate);
+          },
+          getAvailablePlaybackRates: function () {
+            return player ? player.getAvailablePlaybackRates() : [1];
+          },
+          getPlayerState: function () {
+            return player ? player.getPlayerState() : -1;
+          },
+          getVideoLoadedFraction: function () {
+            return player ? player.getVideoLoadedFraction() : 0;
+          },
+          loadVideoById: function (videoId, startSeconds, endSeconds) {
+            if (player) {
+              var options = { videoId: videoId };
+              if (startSeconds !== undefined)
+                options.startSeconds = startSeconds;
+              if (endSeconds !== undefined) options.endSeconds = endSeconds;
+              player.loadVideoById(options);
+            }
+          },
+          cueVideoById: function (videoId, startSeconds, endSeconds) {
+            if (player) {
+              var options = { videoId: videoId };
+              if (startSeconds !== undefined)
+                options.startSeconds = startSeconds;
+              if (endSeconds !== undefined) options.endSeconds = endSeconds;
+              player.cueVideoById(options);
+            }
+          },
+          setSize: function (width, height) {
+            return player && player.setSize(width, height);
+          },
+          updateProgressInterval: function (newInterval) {
+            var interval =
+              Number(newInterval) > 0 ? Number(newInterval) : null;
+            window.currentInterval = interval;
+
+            if (progressInterval) {
+              clearInterval(progressInterval);
+              progressInterval = null;
+            }
+
+            if (
+              interval &&
+              player &&
+              player.getPlayerState() === YT.PlayerState.PLAYING
+            ) {
+              startProgressTracking();
+            }
+          },
+          cleanup: cleanup,
+        };
+      })();
+    </script>
+  </body>
+</html>
